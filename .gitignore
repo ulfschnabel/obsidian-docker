@@ -1,0 +1,16 @@
+# Personal data — never commit
+data/
+
+# Secrets
+.env
+
+# Patched rmapi binary (build from source, see obsidian-remarkable-sync/README.md)
+obsidian-remarkable-sync/rmapi
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+dist/
+build/

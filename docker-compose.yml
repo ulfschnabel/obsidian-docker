@@ -1,0 +1,94 @@
+services:
+  obsidian-couchdb:
+    image: couchdb:3
+    container_name: obsidian-couchdb
+    restart: unless-stopped
+    environment:
+      - COUCHDB_USER=${COUCHDB_USER}
+      - COUCHDB_PASSWORD=${COUCHDB_PASSWORD}
+    volumes:
+      - ./data/couchdb:/opt/couchdb/data
+    ports:
+      - "8796:5984"
+    networks:
+      - default
+      - traefik-proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.obsidian-couchdb.rule=Host(`${COUCHDB_HOST}`)"
+      - "traefik.http.routers.obsidian-couchdb.entrypoints=websecure"
+      - "traefik.http.routers.obsidian-couchdb.tls=true"
+      - "traefik.http.services.obsidian-couchdb.loadbalancer.server.port=5984"
+
+  obsidian-headless:
+    build: ./obsidian-headless
+    container_name: obsidian-headless
+    restart: unless-stopped
+    volumes:
+      - ./data/vault:/vault
+      - ./data/obsidian-config:/obsidian-config
+    ports:
+      - "5901:5900"  # VNC — local only, for initial plugin setup
+    networks:
+      - default
+    environment:
+      - VNC_ENABLED=true  # set to false after initial setup if desired
+
+  obsidian-chroma:
+    image: chromadb/chroma:latest
+    container_name: obsidian-chroma
+    restart: unless-stopped
+    volumes:
+      - ./data/chroma:/chroma/chroma
+    networks:
+      - default
+
+  obsidian-mcp:
+    build: ./obsidian-mcp
+    container_name: obsidian-mcp
+    restart: unless-stopped
+    depends_on:
+      - obsidian-chroma
+    environment:
+      - VAULT_PATH=/vault
+      - CHROMA_HOST=obsidian-chroma
+      - CHROMA_PORT=8000
+      - BEARER_TOKEN=${SEMANTIC_BEARER}
+      - PORT=8000
+      - BASE_URL=https://${MCP_HOST}
+      - AUTHORIZE_PASSWORD=${AUTHORIZE_PASSWORD}
+    volumes:
+      - ./data/vault:/vault
+    ports:
+      - "8794:8000"
+    networks:
+      - default
+      - traefik-proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.obsidian-mcp.rule=Host(`${MCP_HOST}`)"
+      - "traefik.http.routers.obsidian-mcp.entrypoints=websecure"
+      - "traefik.http.routers.obsidian-mcp.tls=true"
+      - "traefik.http.services.obsidian-mcp.loadbalancer.server.port=8000"
+
+  obsidian-remarkable-sync:
+    build: ./obsidian-remarkable-sync
+    container_name: obsidian-remarkable-sync
+    restart: unless-stopped
+    volumes:
+      - ./data/vault:/vault:ro
+      - ./data/rmapi-config:/rmapi-config
+      - ./data/sync-state:/state
+    environment:
+      - VAULT_PATH=/vault
+      - RMAPI_CONFIG=/rmapi-config
+      - MANIFEST_PATH=/state/manifest.json
+      - REMARKABLE_ROOT=Obsidian
+      - DEBOUNCE_SECONDS=60
+      - PAPER_SIZE=a5
+    networks:
+      - default
+
+networks:
+  traefik-proxy:
+    external: true

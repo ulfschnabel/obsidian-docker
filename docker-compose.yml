@@ -1,5 +1,8 @@
 services:
   obsidian-couchdb:
+    # Runaway backstop, not a budget — see openspec/changes/add-memory-guardrails.
+    mem_limit: 256m
+    memswap_limit: 384m
     image: couchdb:3
     container_name: obsidian-couchdb
     restart: unless-stopped
@@ -8,8 +11,10 @@ services:
       - COUCHDB_PASSWORD=${COUCHDB_PASSWORD}
     volumes:
       - ./data/couchdb:/opt/couchdb/data
-    ports:
-      - "8796:5984"
+      # LiveSync CORS config. Must be owned by 5984:5984 mode 644 — the image's
+      # entrypoint chowns/chmods everything under /opt/couchdb under `set -e`, and
+      # that fails on a read-only mount, crash-looping the container.
+      - ./obsidian-couchdb/00-livesync.ini:/opt/couchdb/etc/local.d/00-livesync.ini:ro
     networks:
       - default
       - traefik-proxy
@@ -21,6 +26,9 @@ services:
       - "traefik.http.services.obsidian-couchdb.loadbalancer.server.port=5984"
 
   obsidian-headless:
+    # Runaway backstop, not a budget — see openspec/changes/add-memory-guardrails.
+    mem_limit: 1024m
+    memswap_limit: 1536m
     build: ./obsidian-headless
     container_name: obsidian-headless
     restart: unless-stopped
@@ -35,6 +43,9 @@ services:
       - VNC_ENABLED=true  # set to false after initial setup if desired
 
   obsidian-chroma:
+    # Runaway backstop, not a budget — see openspec/changes/add-memory-guardrails.
+    mem_limit: 256m
+    memswap_limit: 384m
     image: chromadb/chroma:latest
     container_name: obsidian-chroma
     restart: unless-stopped
@@ -44,6 +55,9 @@ services:
       - default
 
   obsidian-mcp:
+    # Runaway backstop, not a budget — see openspec/changes/add-memory-guardrails.
+    mem_limit: 1536m
+    memswap_limit: 2304m
     build: ./obsidian-mcp
     container_name: obsidian-mcp
     restart: unless-stopped
@@ -72,6 +86,9 @@ services:
       - "traefik.http.services.obsidian-mcp.loadbalancer.server.port=8000"
 
   obsidian-remarkable-sync:
+    # Runaway backstop, not a budget — see openspec/changes/add-memory-guardrails.
+    mem_limit: 1024m
+    memswap_limit: 1536m
     build: ./obsidian-remarkable-sync
     container_name: obsidian-remarkable-sync
     restart: unless-stopped

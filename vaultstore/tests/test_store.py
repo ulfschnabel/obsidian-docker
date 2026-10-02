@@ -1,4 +1,5 @@
 """Store operations against a real (throwaway) CouchDB."""
+import base64
 import unicodedata
 from urllib.parse import quote
 
@@ -235,6 +236,114 @@ def test_unreachable_couchdb_is_store_unavailable(clock):
         s.write("a.md", "x")
     with pytest.raises(StoreUnavailable):
         s.read("a.md")
+
+
+# --- put: write returning the note ---------------------------------------------------
+
+def test_put_returns_the_written_note(store, couch_db, clock):
+    note = store.put("Inbox/Idea.md", "# Idea\n")
+    doc = raw(couch_db, "Inbox/Idea.md")
+    assert note.revision == doc["_rev"] and note.id == "inbox/idea.md" and note.path == "Inbox/Idea.md"
+    assert note.content == "# Idea\n" and note.mtime == doc["mtime"] == clock.ms and note.ctime == doc["ctime"]
+    assert note.type == "plain" and note.size == doc["size"] and not note.conflicted
+
+
+def test_put_identical_content_returns_the_current_note(store):
+    first = store.put("a.md", "same")
+    assert store.put("a.md", "same", expected_revision=first.revision) == first
+
+
+# --- copy: a new note reusing the source's chunks ---------------------------------------
+
+def test_copy_reuses_chunks_and_keeps_times(couch_db, clock):
+    s = Store(couch_db.client(), clock=clock)
+    src_rev = s.write("A/Note.md", "one\n\ntwo\n")
+    src = raw(couch_db, "A/Note.md")
+    rec = couch_db.recording_client()
+    note, copied_rev = Store(rec.client, clock=clock).copy("A/Note.md", "B/Note.md")
+    assert rec.writes() == [("PUT", f"/{couch_db.name}/b/note.md")]  # one note, no chunk writes
+    dst = raw(couch_db, "B/Note.md")
+    assert copied_rev == src_rev and note.revision == dst["_rev"] and note.content == "one\n\ntwo\n"
+    assert dst["path"] == "B/Note.md"
+    assert {k: dst[k] for k in ("children", "size", "ctime", "mtime", "type")} == \
+        {k: src[k] for k in ("children", "size", "ctime", "mtime", "type")}
+
+
+def test_copy_attachment_keeps_bytes(store, couch_db):
+    pieces = [b"\x89PNG\r\n", b"\x00\xffdata"]
+    chunks = [fmt.chunk_doc(base64.b64encode(p).decode()) for p in pieces]
+    with couch_db.client() as c:
+        c.post("/_bulk_docs", json={"docs": chunks, "new_edits": False}).raise_for_status()
+        c.put("/img%2Fp.png", json=fmt.note_doc("img/p.png", children=[x["_id"] for x in chunks], size=14,
+                                               ctime=1, mtime=2, type="newnote")).raise_for_status()
+    note, _ = store.copy("img/p.png", "pics/p.png")
+    assert note.type == "newnote" and note.content == b"".join(pieces)
+    assert store.read("pics/p.png").content == b"".join(pieces)
+
+
+def test_copy_onto_live_note_is_exists(store, couch_db):
+    store.write("a.md", "one")
+    rev_b = store.write("b.md", "two")
+    with pytest.raises(Exists):
+        store.copy("a.md", "b.md")
+    assert raw(couch_db, "b.md")["_rev"] == rev_b
+
+
+def test_copy_onto_logically_deleted_note_resurrects(store):
+    store.write("a.md", "one")
+    store.delete("b.md", store.write("b.md", "old"))
+    store.copy("a.md", "b.md")
+    assert store.read("b.md").content == "one"
+
+
+def test_copy_with_stale_revision_is_conflict(store, couch_db):
+    rev1 = store.write("a.md", "one")
+    store.write("a.md", "two", expected_revision=rev1)
+    with pytest.raises(Conflict):
+        store.copy("a.md", "b.md", expected_revision=rev1)
+    assert raw(couch_db, "b.md") is None
+
+
+def test_copy_of_incomplete_note_is_refused(store, couch_db):
+    with couch_db.client() as c:
+        c.put("/a.md", json=fmt.note_doc("a.md", children=["h:missing"], size=1, ctime=1, mtime=1)).raise_for_status()
+    with pytest.raises(IncompleteNote):
+        store.copy("a.md", "b.md")
+    assert raw(couch_db, "b.md") is None
+
+
+def test_copy_of_missing_note_is_not_found(store):
+    with pytest.raises(NotFound):
+        store.copy("a.md", "b.md")
+
+
+def test_copy_onto_itself_is_invalid(store):
+    store.write("Notes/A.md", "one")
+    with pytest.raises(InvalidPath):
+        store.copy("Notes/A.md", "notes/a.md")
+
+
+# --- set_path: case-only renames keep the document ---------------------------------------
+
+def test_set_path_changes_letter_case(store, couch_db):
+    rev = store.write("notes/case.md", "body")
+    note = store.set_path("notes/case.md", "Notes/Case.md", rev)
+    doc = raw(couch_db, "Notes/Case.md")
+    assert doc["_id"] == "notes/case.md" and doc["path"] == "Notes/Case.md" and note.revision == doc["_rev"]
+    assert note.content == "body" and note.path == "Notes/Case.md"
+
+
+def test_set_path_to_another_id_is_invalid(store):
+    rev = store.write("a.md", "body")
+    with pytest.raises(InvalidPath):
+        store.set_path("a.md", "b.md", rev)
+
+
+def test_set_path_with_stale_revision_is_conflict(store):
+    rev1 = store.write("a.md", "one")
+    store.write("a.md", "two", expected_revision=rev1)
+    with pytest.raises(Conflict):
+        store.set_path("a.md", "A.md", rev1)
 
 
 def test_read_reports_conflicts(store, couch_db):

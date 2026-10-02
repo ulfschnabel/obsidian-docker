@@ -44,14 +44,16 @@ class Recorder:
     def __init__(self):
         self.notes = {}
         self.calls = []
+        self.removed_revs = {}
 
     def apply(self, note):
         self.notes[note.id] = note
         self.calls.append(("apply", note.id, note.revision))
 
-    def remove(self, doc_id):
+    def remove(self, doc_id, revision=None):
         self.notes.pop(doc_id, None)
         self.calls.append(("remove", doc_id))
+        self.removed_revs[doc_id] = revision
 
     def reconcile(self, live_ids):
         self.calls.append(("reconcile", set(live_ids)))
@@ -158,6 +160,26 @@ def test_couchdb_tombstone_removes_the_note(couch_db, cp_path, clock):
         c.delete("/a.md", params={"rev": rev}).raise_for_status()
     f.catch_up()
     assert rec.notes == {} and ("remove", "a.md") in rec.calls
+
+
+def test_removal_carries_the_deleting_revision(couch_db, cp_path, clock):
+    s = Store(couch_db.client())
+    rev = s.write("A.md", "one")
+    rec = Recorder()
+    f = make(couch_db, rec, CheckpointFile(cp_path), clock)
+    f.catch_up()
+    deleting = s.delete("A.md", rev)
+    f.catch_up()
+    assert rec.removed_revs == {"a.md": deleting}
+
+
+def test_progress_reports_position_and_pending(couch_db, cp_path, clock):
+    late_note(couch_db)
+    f = make(couch_db, Recorder(), CheckpointFile(cp_path), clock)
+    assert f.progress().seq is None
+    f.catch_up()
+    p = f.progress()
+    assert p.seq == CheckpointFile(cp_path).load().seq and p.pending == 1 and not p.rebuilding
 
 
 def test_conflicted_note_applies_the_winning_revision(couch_db, cp_path, clock):

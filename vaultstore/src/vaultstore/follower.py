@@ -48,8 +48,8 @@ class Projection(Protocol):
     def apply(self, note: Note) -> None:
         """Create or replace the note."""
 
-    def remove(self, doc_id: str) -> None:
-        """Forget the note; an unknown id is a no-op."""
+    def remove(self, doc_id: str, revision: str | None = None) -> None:
+        """Forget the note; an unknown id is a no-op. `revision` is the deleting one, when known."""
 
     def reconcile(self, live_ids: frozenset[str]) -> None:
         """After a full rebuild: forget every note not in `live_ids`."""
@@ -114,6 +114,13 @@ class CheckpointFile:
             os.close(fd)
 
 
+@dataclass(frozen=True)
+class FollowerProgress:
+    seq: str | None  # None before the first contact with the database
+    pending: int
+    rebuilding: bool
+
+
 class FollowerFailed(Exception):
     """CouchDB stayed unavailable beyond the retry budget; the process should exit non-zero."""
 
@@ -173,6 +180,13 @@ class Follower:
         self.catch_up()
         while not stop.is_set():
             self._retrying(lambda: self._step(wait_s=self._wait_s()))
+
+    def progress(self) -> FollowerProgress:
+        return FollowerProgress(
+            seq=self._seq if self._incarnation is not None else None,
+            pending=len(self._pending),
+            rebuilding=self._rebuilding,
+        )
 
     # --- one step: a batch of the feed --------------------------------------------
 
@@ -240,7 +254,7 @@ class Follower:
                 continue
             doc = row.get("doc")
             if row.get("deleted") or doc is None or fmt.is_deleted(doc):
-                self._remove(doc_id)
+                self._remove(doc_id, doc["_rev"] if doc else row["changes"][0]["rev"])
             else:
                 docs.append(doc)
         self._apply_docs(docs)
@@ -263,8 +277,8 @@ class Follower:
             if self._rebuilding:
                 self._live.add(doc["_id"])
 
-    def _remove(self, doc_id: str) -> None:
-        self._projection.remove(doc_id)
+    def _remove(self, doc_id: str, revision: str | None) -> None:
+        self._projection.remove(doc_id, revision)
         self._pending.pop(doc_id, None)
         self._live.discard(doc_id)
 
@@ -292,7 +306,7 @@ class Follower:
         for row in r.json()["rows"]:
             doc = row.get("doc")
             if doc is None or fmt.is_deleted(doc):  # gone, tombstoned, or logically deleted
-                self._remove(row["key"])
+                self._remove(row["key"], doc["_rev"] if doc else row.get("value", {}).get("rev"))
             else:
                 docs.append(doc)
         self._apply_docs(docs)

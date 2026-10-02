@@ -14,7 +14,7 @@ from urllib.parse import quote
 import httpx
 
 from . import format as fmt
-from .errors import Conflict, Exists, IncompleteNote, NotFound, StoreUnavailable
+from .errors import Conflict, Exists, IncompleteNote, InvalidPath, NotFound, StoreUnavailable
 from .guard import Guard
 
 
@@ -139,6 +139,10 @@ class Store:
 
     def write(self, path: str, content: str, expected_revision: str | None = None) -> str:
         """Create (no expected_revision) or update a text note; returns the new revision."""
+        return self.put(path, content, expected_revision).revision
+
+    def put(self, path: str, content: str, expected_revision: str | None = None) -> Note:
+        """As write(), returning the note as written."""
         fmt.check_path(path)
         self.guard.ensure_writable()
         current = self._get_doc(fmt.path2id(path))
@@ -152,20 +156,68 @@ class Store:
             if current["_rev"] != expected_revision:
                 raise Conflict.for_path(path, current["_rev"])
             if self._same_content(current, content):
-                return current["_rev"]
+                return note_from_doc(current, content)
 
         pieces = fmt.split_text(content)
         self.put_chunks(fmt.chunk_doc(p) for p in pieces)
         now = self._now()
         doc = fmt.note_doc(
-            current["path"] if live else path,  # casing changes only through a move
+            current["path"] if live else path,  # casing changes only through set_path
             children=[fmt.chunk_id(p) for p in pieces],
             size=fmt.content_size(content),
             ctime=current.get("ctime", now) if live else now,
             mtime=now,
             rev=current["_rev"] if current is not None else None,  # resurrects a logically deleted note
         )
-        return self.put_note(doc, path)
+        return note_from_doc({**doc, "_rev": self.put_note(doc, path)}, content)
+
+    def copy(self, src: str, dst: str, expected_revision: str | None = None) -> tuple[Note, str]:
+        """Create `dst` as a copy of the live note `src`, reusing its chunks.
+
+        Works for attachments as for text, and keeps ctime and mtime. Returns
+        the new note and the source revision that was copied; `src` is untouched.
+        """
+        fmt.check_path(src)
+        fmt.check_path(dst)
+        self.guard.ensure_writable()
+        source = self._get_doc(fmt.path2id(src))
+        if source is None or fmt.is_deleted(source):
+            raise NotFound(f"no note at {src!r}")
+        if expected_revision is not None and source["_rev"] != expected_revision:
+            raise Conflict.for_path(src, source["_rev"])
+        if fmt.path2id(dst) == source["_id"]:
+            raise InvalidPath(f"{dst!r} is the same note as {src!r}; use set_path to change its letter case")
+        content = self.decode(source)  # refuses an incomplete source
+        target = self._get_doc(fmt.path2id(dst))
+        if target is not None and not fmt.is_deleted(target):
+            raise Exists.for_path(dst)
+        doc = fmt.note_doc(
+            dst,
+            children=source.get("children", []),
+            size=source.get("size", 0),
+            ctime=source.get("ctime", 0),
+            mtime=source.get("mtime", 0),
+            type=source.get("type", "plain"),
+            rev=target["_rev"] if target is not None else None,
+        )
+        return note_from_doc({**doc, "_rev": self.put_note(doc, dst)}, content), source["_rev"]
+
+    def set_path(self, path: str, new_path: str, expected_revision: str) -> Note:
+        """Change a note's stored path where its id stays the same (letter case only)."""
+        fmt.check_path(new_path)
+        self.guard.ensure_writable()
+        current = self._get_doc(fmt.path2id(path))
+        if current is None or fmt.is_deleted(current):
+            raise NotFound(f"no note at {path!r}")
+        if current["_rev"] != expected_revision:
+            raise Conflict.for_path(path, current["_rev"])
+        if fmt.path2id(new_path) != current["_id"]:
+            raise InvalidPath(f"{new_path!r} is a different note than {path!r}; only the letter case can change in place")
+        content = self.decode(current)
+        if current["path"] == new_path:
+            return note_from_doc(current, content)
+        doc = {**current, "path": new_path, "mtime": self._now()}
+        return note_from_doc({**doc, "_rev": self.put_note(doc, new_path)}, content)
 
     def delete(self, path: str, expected_revision: str) -> str:
         """Logically delete a note (children kept); returns the new revision."""

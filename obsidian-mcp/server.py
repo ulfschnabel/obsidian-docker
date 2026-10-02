@@ -29,7 +29,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.routing import Mount, Route
 
-from semantic_index import COLLECTION, SemanticIndex
+from semantic_index import COLLECTION, SemanticIndex, model_embedder
 from vault_tools import Catalog, VaultTools
 from vaultstore.errors import IncompatibleVault, VaultError
 from vaultstore.follower import CheckpointFile, Follower
@@ -64,7 +64,7 @@ collection = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT).get_or_crea
 
 catalog = Catalog()
 catalog_follower = Follower(couch_client(), catalog)
-index = SemanticIndex(collection, lambda text: model.encode(text).tolist())
+index = SemanticIndex(collection, model_embedder(model))
 index_follower = Follower(couch_client(), index, CheckpointFile(STATE_DIR / "semantic-index.json"))
 tools = VaultTools(Store(couch_client()), catalog, catalog_follower=catalog_follower, index_follower=index_follower)
 

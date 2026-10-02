@@ -9,6 +9,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Pre-bake the model so container startup is fast
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+# ...and load it from that cache: startup never depends on the Hugging Face Hub
+ENV HF_HUB_OFFLINE=1
 
 # vaultstore comes from the compose build context of the same name (additional_contexts).
 RUN --mount=type=bind,from=vaultstore,target=/src/vaultstore,rw \

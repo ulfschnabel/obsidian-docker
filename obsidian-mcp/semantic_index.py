@@ -28,6 +28,11 @@ def _digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
 
 
+def model_embedder(model) -> Callable[[str], list[float]]:
+    """An embed function for a SentenceTransformer, without its per-call progress bar."""
+    return lambda text: model.encode(text, show_progress_bar=False).tolist()
+
+
 class SemanticIndex:
     def __init__(self, collection, embed: Callable[[str], list[float]]):
         self._col = collection

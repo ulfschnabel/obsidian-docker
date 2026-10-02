@@ -7,7 +7,7 @@ from urllib.parse import quote
 
 import pytest
 
-from semantic_index import SemanticIndex
+from semantic_index import SemanticIndex, model_embedder
 from vaultstore import format as fmt
 from vaultstore.follower import CheckpointFile, Follower
 from vaultstore.store import Store
@@ -169,3 +169,23 @@ def test_note_emptied_later_leaves_the_index(couch_db, tmp_path, store):
     store.write("A.md", "", expected_revision=rev)
     s.sync()
     assert s.collection.rows == {}
+
+
+def test_model_embedder_encodes_quietly():
+    """One progress bar per note would flood the service log."""
+
+    class FakeArray:
+        def tolist(self):
+            return [0.25, 0.5]
+
+    class FakeModel:
+        def __init__(self):
+            self.calls = []
+
+        def encode(self, text, **kwargs):
+            self.calls.append((text, kwargs))
+            return FakeArray()
+
+    model = FakeModel()
+    assert model_embedder(model)("some text") == [0.25, 0.5]
+    assert model.calls == [("some text", {"show_progress_bar": False})]

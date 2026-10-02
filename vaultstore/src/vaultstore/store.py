@@ -27,6 +27,14 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def request(client: httpx.Client, method: str, url: str, **kw) -> httpx.Response:
+    """Send a request; transport failures become STORE_UNAVAILABLE."""
+    try:
+        return client.request(method, url, **kw)
+    except httpx.TransportError as e:
+        raise StoreUnavailable(f"CouchDB unreachable: {e}") from e
+
+
 @dataclass(frozen=True)
 class Note:
     id: str
@@ -40,6 +48,21 @@ class Note:
     conflicted: bool
 
 
+def note_from_doc(doc: dict, content: str | bytes) -> Note:
+    """A note at the revision of `doc` (fetched with conflicts=true for `conflicted`)."""
+    return Note(
+        id=doc["_id"],
+        path=doc["path"],
+        content=content,
+        revision=doc["_rev"],
+        ctime=doc.get("ctime", 0),
+        mtime=doc.get("mtime", 0),
+        size=doc.get("size", 0),
+        type=doc.get("type", "plain"),
+        conflicted=bool(doc.get("_conflicts")),
+    )
+
+
 class Store:
     def __init__(self, client: httpx.Client, *, guard: Guard | None = None, clock: Callable[[], int] = _now_ms):
         self._c = client
@@ -49,10 +72,7 @@ class Store:
     # --- HTTP ------------------------------------------------------------------
 
     def _request(self, method: str, url: str, **kw) -> httpx.Response:
-        try:
-            return self._c.request(method, url, **kw)
-        except httpx.TransportError as e:
-            raise StoreUnavailable(f"CouchDB unreachable: {e}") from e
+        return request(self._c, method, url, **kw)
 
     def _get_doc(self, doc_id: str, *, conflicts: bool = False) -> dict | None:
         r = self._request("GET", doc_path(doc_id), params={"conflicts": "true"} if conflicts else None)
@@ -113,17 +133,7 @@ class Store:
         doc = self._get_doc(fmt.path2id(path), conflicts=True)
         if doc is None or fmt.is_deleted(doc):
             raise NotFound(f"no note at {path!r}")
-        return Note(
-            id=doc["_id"],
-            path=doc["path"],
-            content=self.decode(doc),
-            revision=doc["_rev"],
-            ctime=doc.get("ctime", 0),
-            mtime=doc.get("mtime", 0),
-            size=doc.get("size", 0),
-            type=doc.get("type", "plain"),
-            conflicted=bool(doc.get("_conflicts")),
-        )
+        return note_from_doc(doc, self.decode(doc))
 
     # --- writes ----------------------------------------------------------------
 

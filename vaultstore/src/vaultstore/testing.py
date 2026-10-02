@@ -109,14 +109,19 @@ class TestDb:
         return rec
 
 
-def init_livesync_db(db: TestDb, *, tweaks: dict | None = None, locked: bool = False, version: int = 12) -> None:
-    """Create the control documents a LiveSync-initialised remote database carries."""
+def init_livesync_db(
+    db: TestDb, *, tweaks: dict | None = None, locked: bool = False, version: int = 12, created: int | None = None,
+) -> None:
+    """Create the control documents a LiveSync-initialised remote database carries.
+
+    `created` identifies the database incarnation; it defaults to now in ms, as LiveSync sets it.
+    """
     with db.client() as c:
         c.put(
             "/_local/obsydian_livesync_milestone",
             json={
                 "type": "milestoneinfo",
-                "created": int(time.time() * 1000),
+                "created": int(time.time() * 1000) if created is None else created,
                 "locked": locked,
                 "accepted_nodes": [],
                 "node_info": {},

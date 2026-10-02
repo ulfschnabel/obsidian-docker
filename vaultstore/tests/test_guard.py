@@ -74,6 +74,15 @@ def test_reevaluates_after_ttl(couch_db):
         g.ensure_writable()
 
 
+def test_status_reports_the_database_incarnation(bare_db):
+    init_livesync_db(bare_db, created=1777986784536, tweaks={"encrypt": True})
+    assert guard_for(bare_db).status().incarnation == 1777986784536
+
+
+def test_no_incarnation_without_a_milestone(bare_db):
+    assert guard_for(bare_db).status().incarnation is None
+
+
 def test_real_cli_milestone_is_compatible(bare_db, golden):
     # The milestone the real 1.0.15 core created (with its own node entry) passes.
     m = dict(golden.milestone)

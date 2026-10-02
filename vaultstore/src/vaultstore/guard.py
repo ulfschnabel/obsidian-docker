@@ -29,6 +29,9 @@ class GuardStatus:
     writable: bool
     readable: bool
     reason: str | None
+    # The milestone's `created`: identifies this incarnation of the database,
+    # which a device's "rebuild remote" replaces. None without a milestone.
+    incarnation: int | None = None
 
 
 class Guard:
@@ -71,18 +74,22 @@ class Guard:
         milestone = self._get(MILESTONE)
         if milestone is None:
             return GuardStatus(False, True, "LiveSync milestone document missing; the database was not initialised by LiveSync")
+        created = milestone.get("created")
+        incarnation = created if isinstance(created, int) else None
         preferred = (milestone.get("tweak_values") or {}).get("PREFERRED")
         if preferred is None:
-            return GuardStatus(False, True, "LiveSync milestone has no PREFERRED tweak values")
+            return GuardStatus(False, True, "LiveSync milestone has no PREFERRED tweak values", incarnation)
         enabled = [k for k in BLOCKS_WRITES if preferred.get(k)]
         if enabled:
             readable = not any(k in BLOCKS_READS for k in enabled)
-            return GuardStatus(False, readable, f"unsupported vault setting(s) enabled: {', '.join(enabled)}")
+            return GuardStatus(False, readable, f"unsupported vault setting(s) enabled: {', '.join(enabled)}", incarnation)
         version = self._get(VERSION_DOC)
         if version is None:
-            return GuardStatus(False, True, "LiveSync version document missing")
+            return GuardStatus(False, True, "LiveSync version document missing", incarnation)
         if version.get("version", 0) > MAX_VERSION:
-            return GuardStatus(False, False, f"database version {version.get('version')} is newer than supported ({MAX_VERSION})")
+            return GuardStatus(
+                False, False, f"database version {version.get('version')} is newer than supported ({MAX_VERSION})", incarnation,
+            )
         if milestone.get("locked"):
-            return GuardStatus(False, True, "the remote database is locked (a device is rebuilding it)")
-        return GuardStatus(True, True, None)
+            return GuardStatus(False, True, "the remote database is locked (a device is rebuilding it)", incarnation)
+        return GuardStatus(True, True, None, incarnation)

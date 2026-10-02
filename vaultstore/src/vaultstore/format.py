@@ -143,9 +143,14 @@ def chunk_doc(piece: str) -> dict:
     return {"_id": cid, "_rev": chunk_rev(cid, piece), "type": "leaf", "data": piece}
 
 
+def file_bytes(content: str | bytes) -> bytes:
+    """The file a device writes for decoded note content (UTF-8 as TextEncoder produces it)."""
+    return content if isinstance(content, bytes) else _js_utf8(content)
+
+
 def content_size(content: str | bytes) -> int:
     """`size` as the core records it: bytes of the decoded content (UTF-8 for text)."""
-    return len(content) if isinstance(content, bytes) else len(_js_utf8(content))
+    return len(file_bytes(content))
 
 
 def note_doc(

@@ -85,6 +85,19 @@ class TestChunkRev:
                        "type": "leaf", "data": "hello"}
 
 
+class TestFileBytes:
+    def test_text_is_utf8_as_a_device_writes_it(self):
+        assert fmt.file_bytes("Größe ✓\r\n") == "Größe ✓\r\n".encode("utf-8")
+        assert fmt.file_bytes("a\ud800b") == "a\ufffdb".encode("utf-8")  # lone surrogate, as TextEncoder
+
+    def test_attachments_are_their_bytes(self):
+        assert fmt.file_bytes(b"\x00\xff") == b"\x00\xff"
+
+    def test_size_is_the_file_length(self):
+        for content in ("Größe ✓", "", "a\ud800b", b"\x00\x01"):
+            assert fmt.content_size(content) == len(fmt.file_bytes(content))
+
+
 class TestSize:
     def test_utf8_bytes_not_characters(self):
         assert fmt.content_size("Größe ✓") == 11

@@ -58,13 +58,21 @@ services:
     # Runaway backstop, not a budget — see openspec/changes/add-memory-guardrails.
     mem_limit: 1536m
     memswap_limit: 2304m
-    build: ./obsidian-mcp
+    build:
+      context: ./obsidian-mcp
+      additional_contexts:
+        vaultstore: ./vaultstore
     container_name: obsidian-mcp
     restart: unless-stopped
     depends_on:
       - obsidian-chroma
+      - obsidian-couchdb
     environment:
-      - VAULT_PATH=/vault
+      # Notes are read and written in CouchDB only; there is no vault mount.
+      - COUCHDB_URL=http://obsidian-couchdb:5984/obsidian
+      - COUCHDB_USER=${VAULT_WRITER_USER}
+      - COUCHDB_PASSWORD=${VAULT_WRITER_PASSWORD}
+      - STATE_DIR=/state
       - CHROMA_HOST=obsidian-chroma
       - CHROMA_PORT=8000
       - BEARER_TOKEN=${SEMANTIC_BEARER}
@@ -72,7 +80,7 @@ services:
       - BASE_URL=https://${MCP_HOST}
       - AUTHORIZE_PASSWORD=${AUTHORIZE_PASSWORD}
     volumes:
-      - ./data/vault:/vault
+      - ./data/mcp-state:/state  # semantic index checkpoint
     ports:
       - "8794:8000"
     networks:
@@ -84,6 +92,32 @@ services:
       - "traefik.http.routers.obsidian-mcp.entrypoints=websecure"
       - "traefik.http.routers.obsidian-mcp.tls=true"
       - "traefik.http.services.obsidian-mcp.loadbalancer.server.port=8000"
+
+  obsidian-vault-mirror:
+    # Runaway backstop, not a budget — see openspec/changes/add-memory-guardrails.
+    mem_limit: 256m
+    memswap_limit: 384m
+    build:
+      context: ./obsidian-vault-mirror
+      additional_contexts:
+        vaultstore: ./vaultstore
+    container_name: obsidian-vault-mirror
+    restart: unless-stopped
+    depends_on:
+      - obsidian-couchdb
+    environment:
+      - COUCHDB_URL=http://obsidian-couchdb:5984/obsidian
+      - COUCHDB_USER=${VAULT_READER_USER}
+      - COUCHDB_PASSWORD=${VAULT_READER_PASSWORD}
+      - MIRROR_ROOT=/mirror
+      - STATE_DIR=/state
+    volumes:
+      # The only writer of data/mirror; every other service mounts it read-only.
+      # Both host directories must exist and be owned by uid 1000 before the first start.
+      - ./data/mirror:/mirror
+      - ./data/mirror-state:/state
+    networks:
+      - default
 
   obsidian-remarkable-sync:
     # Runaway backstop, not a budget — see openspec/changes/add-memory-guardrails.

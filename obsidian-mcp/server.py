@@ -1,27 +1,44 @@
-import os
-import re
-import threading
+"""Obsidian MCP: vault tools over the LiveSync CouchDB database, plus OAuth for remote clients.
+
+CouchDB is the vault's only writable copy (openspec change couchdb-source-of-truth).
+Tool logic lives in vault_tools.py and semantic_index.py; this module wires
+them to FastMCP, the embedding model, Chroma, and two change-feed followers:
+the note catalog (rebuilt in memory at every start) and the semantic index
+(persisted, with a checkpoint in STATE_DIR).
+"""
+import base64
 import hashlib
 import hmac
+import logging
+import os
 import secrets
-import base64
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlencode
 
 import chromadb
+import httpx
 import uvicorn
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from sentence_transformers import SentenceTransformer
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, RedirectResponse, HTMLResponse
-from starlette.routing import Route, Mount
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.routing import Mount, Route
 
-VAULT_PATH = Path(os.getenv("VAULT_PATH", "/vault"))
+from semantic_index import COLLECTION, SemanticIndex
+from vault_tools import Catalog, VaultTools
+from vaultstore.errors import IncompatibleVault, VaultError
+from vaultstore.follower import CheckpointFile, Follower
+from vaultstore.store import Store
+
+COUCHDB_URL = os.environ["COUCHDB_URL"]  # the obsidian database, e.g. http://obsidian-couchdb:5984/obsidian
+COUCHDB_USER = os.environ["COUCHDB_USER"]  # a member of the database, not a server admin
+COUCHDB_PASSWORD = os.environ["COUCHDB_PASSWORD"]
+STATE_DIR = Path(os.getenv("STATE_DIR", "/state"))
 CHROMA_HOST = os.getenv("CHROMA_HOST", "obsidian-chroma")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
 BEARER_TOKEN = os.getenv("BEARER_TOKEN", "")
@@ -31,314 +48,206 @@ AUTHORIZE_PASSWORD = os.getenv("AUTHORIZE_PASSWORD", "")
 _CLAUDE_CLIENT_ID = "d7251a335098f456c042c6a3d96146d9"
 _SERVER_NAME = "Obsidian MCP"
 
-print("Loading model...")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("obsidian-mcp")
+
+
+def couch_client() -> httpx.Client:
+    return httpx.Client(base_url=COUCHDB_URL, auth=(COUCHDB_USER, COUCHDB_PASSWORD), timeout=60)
+
+
+log.info("Loading model...")
 model = SentenceTransformer("all-MiniLM-L6-v2")
-print("Connecting to ChromaDB...")
-chroma_client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
-collection = chroma_client.get_or_create_collection("vault")
+log.info("Connecting to ChromaDB...")
+collection = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT).get_or_create_collection(COLLECTION)
 
-mcp = FastMCP("obsidian-mcp")
+catalog = Catalog()
+catalog_follower = Follower(couch_client(), catalog)
+index = SemanticIndex(collection, lambda text: model.encode(text).tolist())
+index_follower = Follower(couch_client(), index, CheckpointFile(STATE_DIR / "semantic-index.json"))
+tools = VaultTools(Store(couch_client()), catalog, catalog_follower=catalog_follower, index_follower=index_follower)
+
+mcp = FastMCP(
+    "obsidian-mcp",
+    instructions=(
+        "Tools for an Obsidian vault that also syncs to the user's phone and other devices. "
+        "Paths are vault-relative; '.md' is optional for notes. read_note returns a `revision`: "
+        "overwriting, deleting, moving or renaming a note requires it as `expected_revision`, so an "
+        "edit made elsewhere since you read the note is never silently overwritten (you get CONFLICT; "
+        "read again and redo your change). To add to a note or change one passage, use append_to_note "
+        "or replace_in_note, which need no revision. Errors start with a code such as EXISTS, CONFLICT, "
+        "NOT_FOUND, NO_MATCH, AMBIGUOUS_MATCH, INVALID_PATH or STORE_UNAVAILABLE."
+    ),
+)
 
 
-def note_id(path: Path) -> str:
-    return hashlib.md5(str(path).encode()).hexdigest()
-
-
-def to_relative(path: Path) -> str:
-    return str(path.relative_to(VAULT_PATH))
-
-
-def resolve_path(rel_path: str) -> Path:
-    p = VAULT_PATH / rel_path
-    if not rel_path.endswith(".md"):
-        p = p.with_suffix(".md")
-    return p
-
-
-# --- Indexing ---
-
-def index_file(path: Path):
+def _run(method, *args, **kwargs):
+    """Call a VaultTools method; a VaultError becomes a tool error whose text starts with its code."""
     try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
-        if not text.strip():
-            return
-        embedding = model.encode(text[:8000]).tolist()
-        collection.upsert(
-            ids=[note_id(path)],
-            embeddings=[embedding],
-            documents=[text[:2000]],
-            metadatas=[{"path": to_relative(path), "filename": path.name}],
-        )
-    except Exception as e:
-        print(f"Index error {path}: {e}")
+        return method(*args, **kwargs)
+    except VaultError as e:
+        raise ToolError(str(e)) from None
 
 
-def remove_from_index(path: Path):
-    try:
-        collection.delete(ids=[note_id(path)])
-    except Exception:
-        pass
+class _AnswersAreNotFaults(logging.Filter):
+    """FastMCP logs every tool error with a traceback. A VaultError (EXISTS, CONFLICT, ...) is an
+    answer to the agent, not a server fault: log it as one INFO line so real faults stand out."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc = record.exc_info[1] if record.exc_info else None
+        if isinstance(exc, ToolError) and isinstance(exc.__context__, VaultError):
+            record.msg, record.args, record.exc_info = f"{record.getMessage()}: {exc}", (), None
+            record.levelno, record.levelname = logging.INFO, "INFO"
+        return True
 
 
-def index_vault():
-    files = list(VAULT_PATH.rglob("*.md"))
-    print(f"Indexing {len(files)} notes...")
-    for f in files:
-        index_file(f)
-    print("Indexing complete.")
-
-
-class VaultWatcher(FileSystemEventHandler):
-    def on_modified(self, event):
-        if not event.is_directory and event.src_path.endswith(".md"):
-            index_file(Path(event.src_path))
-
-    def on_created(self, event):
-        if not event.is_directory and event.src_path.endswith(".md"):
-            index_file(Path(event.src_path))
-
-    def on_deleted(self, event):
-        if not event.is_directory and event.src_path.endswith(".md"):
-            remove_from_index(Path(event.src_path))
-
-    def on_moved(self, event):
-        if not event.is_directory:
-            if event.src_path.endswith(".md"):
-                remove_from_index(Path(event.src_path))
-            if event.dest_path.endswith(".md"):
-                index_file(Path(event.dest_path))
+logging.getLogger("fastmcp.server.server").addFilter(_AnswersAreNotFaults())
 
 
 # --- Tools ---
 
 @mcp.tool()
 def list_notes(folder: str = "") -> list[str]:
-    """List all notes in the vault, optionally filtered to a subfolder."""
-    base = VAULT_PATH / folder if folder else VAULT_PATH
-    return [to_relative(p) for p in sorted(base.rglob("*.md"))]
+    """List the vault's markdown notes as vault-relative paths, optionally only those under `folder`
+    (letter case is ignored)."""
+    return _run(tools.list_notes, folder)
 
 
 @mcp.tool()
-def read_note(path: str) -> str:
-    """Read the full content of a note by its vault-relative path."""
-    p = resolve_path(path)
-    if not p.exists():
-        return f"Note not found: {path}"
-    return p.read_text(encoding="utf-8", errors="ignore")
+def read_note(path: str) -> dict:
+    """Read a note. Returns {path, content, revision, mtime, conflicted}.
+
+    Keep `revision`: write_note (to overwrite), delete_note, move_note and rename_note require it as
+    `expected_revision`. `conflicted` is true when devices hold unresolved conflicting versions.
+    The path is vault-relative; '.md' is optional and letter case is ignored.
+    """
+    return _run(tools.read_note, path)
 
 
 @mcp.tool()
-def write_note(path: str, content: str) -> str:
-    """Write (create or overwrite) a note. Path is vault-relative, .md extension optional."""
-    p = resolve_path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content, encoding="utf-8")
-    index_file(p)
-    return f"Written: {to_relative(p)}"
+def write_note(path: str, content: str, expected_revision: str | None = None) -> dict:
+    """Create a note, or overwrite one you have read. Returns {path, revision, status}.
+
+    To create, omit expected_revision: it fails with EXISTS if the note already exists.
+    To overwrite, pass the `revision` from read_note: it fails with CONFLICT if the note changed
+    since (for example, edited on a phone); read it again and redo your change on the new content.
+    To add text or change one passage, prefer append_to_note or replace_in_note: they need no revision.
+    """
+    return _run(tools.write_note, path, content, expected_revision)
 
 
 @mcp.tool()
-def delete_note(path: str) -> str:
-    """Delete a note by vault-relative path."""
-    p = resolve_path(path)
-    if not p.exists():
-        return f"Not found: {path}"
-    remove_from_index(p)
-    p.unlink()
-    return f"Deleted: {to_relative(p)}"
+def append_to_note(path: str, text: str) -> dict:
+    """Append `text` to the end of a note, creating the note if it does not exist.
 
-
-def _rewrite_wikilinks(moves: list[tuple[Path, Path]]) -> int:
-    """Rewrite [[wikilinks]] across the vault for a batch of moves.
-    moves is a list of (old_path, new_path) pairs. Returns number of files changed."""
-    if not moves:
-        return 0
-
-    # Build substitution rules: for each move, handle stem-only and path-qualified links
-    rules: list[tuple[re.Pattern, str]] = []
-    for old, new in moves:
-        old_stem = re.escape(old.stem)
-        old_rel = re.escape(to_relative(old).removesuffix(".md"))
-        new_rel = to_relative(new).removesuffix(".md")
-        new_stem = new.stem
-        # Path-qualified links (more specific — must come first)
-        rules.append((
-            re.compile(r'\[\[' + old_rel + r'(\|[^\]]*)?]]', re.IGNORECASE),
-            lambda m, nr=new_rel: f'[[{nr}{m.group(1) or ""}]]'
-        ))
-        # Stem-only links (only when stem changes)
-        if old.stem.lower() != new.stem.lower():
-            rules.append((
-                re.compile(r'\[\[' + old_stem + r'(\|[^\]]*)?]]', re.IGNORECASE),
-                lambda m, ns=new_stem: f'[[{ns}{m.group(1) or ""}]]'
-            ))
-
-    new_paths = {new for _, new in moves}
-    changed = 0
-    for p in VAULT_PATH.rglob("*.md"):
-        if p in new_paths:
-            continue
-        try:
-            text = p.read_text(encoding="utf-8", errors="ignore")
-            result = text
-            for pattern, repl in rules:
-                result = pattern.sub(repl, result)
-            if result != text:
-                p.write_text(result, encoding="utf-8")
-                index_file(p)
-                changed += 1
-        except Exception:
-            pass
-    return changed
-
-
-def _move_note_internal(src: Path, dst: Path) -> str:
-    if not src.exists():
-        return f"Not found: {to_relative(src)}"
-    if dst.exists():
-        return f"Destination already exists: {to_relative(dst)}"
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_text(src.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
-    updated = _rewrite_wikilinks([(src, dst)])
-    remove_from_index(src)
-    src.unlink()
-    index_file(dst)
-    msg = f"Moved: {to_relative(src)} → {to_relative(dst)}"
-    if updated:
-        msg += f" (updated links in {updated} note{'s' if updated != 1 else ''})"
-    return msg
+    The text is added exactly as given: start it with a newline if the note may not end with one.
+    Safe against edits made elsewhere at the same time; needs no revision.
+    """
+    return _run(tools.append_to_note, path, text)
 
 
 @mcp.tool()
-def move_note(src: str, dst: str) -> str:
-    """Move a note to a new vault-relative path, rewriting all [[wikilinks]] that point to it."""
-    return _move_note_internal(resolve_path(src), resolve_path(dst))
+def replace_in_note(path: str, old: str, new: str) -> dict:
+    """Replace one exact passage of a note: `old` must occur exactly once.
+
+    Fails with NO_MATCH if `old` does not occur and AMBIGUOUS_MATCH if it occurs more than once
+    (include more surrounding text to make it unique). Safe against edits made elsewhere at the
+    same time; needs no revision.
+    """
+    return _run(tools.replace_in_note, path, old, new)
 
 
 @mcp.tool()
-def rename_note(path: str, new_name: str) -> str:
-    """Rename a note in place (same folder), rewriting all [[wikilinks]] that point to it."""
-    src = resolve_path(path)
-    if not new_name.endswith(".md"):
-        new_name += ".md"
-    return _move_note_internal(src, src.parent / new_name)
+def delete_note(path: str, expected_revision: str) -> dict:
+    """Delete a note. Requires the `revision` from read_note; fails with CONFLICT if the note
+    changed since you read it."""
+    return _run(tools.delete_note, path, expected_revision)
 
 
 @mcp.tool()
-def move_folder(src: str, dst: str) -> str:
-    """Move an entire folder of notes to a new location, rewriting all [[wikilinks]]."""
-    src_dir = (VAULT_PATH / src).resolve()
-    dst_dir = (VAULT_PATH / dst).resolve()
-    if not src_dir.is_dir():
-        return f"Folder not found: {src}"
-    notes = list(src_dir.rglob("*.md"))
-    if not notes:
-        return f"No notes in: {src}"
+def move_note(src: str, dst: str, expected_revision: str) -> dict:
+    """Move a note to a new vault-relative path and rewrite [[wikilinks]] that point to it.
 
-    moves = []
-    for note in notes:
-        rel = note.relative_to(src_dir)
-        new_path = dst_dir / rel
-        new_path.parent.mkdir(parents=True, exist_ok=True)
-        new_path.write_text(note.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
-        moves.append((note, new_path))
-
-    updated = _rewrite_wikilinks(moves)
-
-    for old, _ in moves:
-        remove_from_index(old)
-        old.unlink()
-    for _, new in moves:
-        index_file(new)
-
-    # Remove now-empty source dirs
-    for d in sorted(src_dir.rglob("*"), reverse=True):
-        if d.is_dir():
-            try:
-                d.rmdir()
-            except OSError:
-                pass
-    try:
-        src_dir.rmdir()
-    except OSError:
-        pass
-
-    msg = f"Moved {len(moves)} note{'s' if len(moves) != 1 else ''}: {src} → {dst}"
-    if updated:
-        msg += f" (updated links in {updated} note{'s' if updated != 1 else ''})"
-    return msg
+    Requires the source's `revision` from read_note. Fails with EXISTS if a note is already at `dst`.
+    The destination is created before the source is deleted, so content is never lost; the result
+    lists the steps completed and any notes whose links could not be updated.
+    """
+    return _run(tools.move_note, src, dst, expected_revision)
 
 
 @mcp.tool()
-def rename_folder(path: str, new_name: str) -> str:
-    """Rename a folder in place (same parent), rewriting all [[wikilinks]]."""
-    src_dir = VAULT_PATH / path
-    dst_dir = src_dir.parent / new_name
-    return move_folder(
-        str(src_dir.relative_to(VAULT_PATH)),
-        str(dst_dir.relative_to(VAULT_PATH)),
-    )
+def rename_note(path: str, new_name: str, expected_revision: str) -> dict:
+    """Rename a note within its folder and rewrite [[wikilinks]] that point to it.
+
+    `new_name` is a name, not a path ('.md' optional). Requires the note's `revision` from read_note.
+    """
+    return _run(tools.rename_note, path, new_name, expected_revision)
+
+
+@mcp.tool()
+def move_folder(src: str, dst: str) -> dict:
+    """Move every note and attachment under folder `src` to `dst`, rewriting [[wikilinks]].
+
+    Reports each document's outcome; a document that cannot move (for example, EXISTS at its
+    destination) stays where it is.
+    """
+    return _run(tools.move_folder, src, dst)
+
+
+@mcp.tool()
+def rename_folder(path: str, new_name: str) -> dict:
+    """Rename a folder in place (same parent), rewriting [[wikilinks]]. `new_name` is a name, not a path."""
+    return _run(tools.rename_folder, path, new_name)
 
 
 @mcp.tool()
 def search_notes(query: str, max_results: int = 10) -> list[dict]:
-    """Keyword search across all notes. Returns matching notes with context excerpts."""
-    pattern = re.compile(re.escape(query), re.IGNORECASE)
-    results = []
-    for p in VAULT_PATH.rglob("*.md"):
-        try:
-            text = p.read_text(encoding="utf-8", errors="ignore")
-            m = pattern.search(text)
-            if m:
-                start = max(0, m.start() - 100)
-                excerpt = text[start:start + 300].strip()
-                results.append({"path": to_relative(p), "excerpt": excerpt})
-                if len(results) >= max_results:
-                    break
-        except Exception:
-            pass
-    return results
+    """Case-insensitive keyword search. Returns matching notes with an excerpt around the first match."""
+    return _run(tools.search_notes, query, max_results)
 
 
 @mcp.tool()
 def semantic_search(query: str, n_results: int = 5) -> list[dict]:
-    """Semantic similarity search across all notes using vector embeddings."""
-    embedding = model.encode(query).tolist()
-    results = collection.query(query_embeddings=[embedding], n_results=min(n_results, 10))
-    if not results["documents"] or not results["documents"][0]:
-        return []
-    return [
-        {"path": m["path"], "filename": m["filename"], "excerpt": d[:500], "score": round(1 - s, 3)}
-        for d, m, s in zip(results["documents"][0], results["metadatas"][0], results["distances"][0])
-    ]
+    """Semantic similarity search across all notes using vector embeddings (at most 10 results)."""
+    return _run(index.search, query, n_results)
 
 
 @mcp.tool()
 def get_backlinks(path: str) -> list[str]:
-    """Find all notes that contain a [[wikilink]] pointing to the given note."""
-    target = Path(resolve_path(path)).stem
-    pattern = re.compile(r'\[\[' + re.escape(target) + r'(\|[^\]]+)?\]\]', re.IGNORECASE)
-    return [
-        to_relative(p)
-        for p in VAULT_PATH.rglob("*.md")
-        if p.stem != target and pattern.search(p.read_text(encoding="utf-8", errors="ignore"))
-    ]
+    """Find notes that link to the given note by name: [[Name]] or [[Name|alias]]."""
+    return _run(tools.get_backlinks, path)
 
 
 @mcp.tool()
 def get_tags() -> list[str]:
-    """Return all unique #tags used across the vault."""
-    tag_pattern = re.compile(r'(?<![`\w])#([a-zA-Z][a-zA-Z0-9/_-]*)')
-    tags: set[str] = set()
-    for p in VAULT_PATH.rglob("*.md"):
-        try:
-            text = p.read_text(encoding="utf-8", errors="ignore")
-            text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
-            text = re.sub(r'`[^`]*`', '', text)
-            tags.update(tag_pattern.findall(text))
-        except Exception:
-            pass
-    return sorted(tags)
+    """Return all unique #tags used across the vault (tags inside code are ignored)."""
+    return _run(tools.get_tags)
+
+
+@mcp.tool()
+def vault_status() -> dict:
+    """Report the vault connection's health: whether writes are allowed (and why not), whether the
+    note catalog has loaded, the change-feed positions, and notes still waiting for data from a device."""
+    return _run(tools.vault_status)
+
+
+def _follow(name: str, follower: Follower) -> None:
+    """Run a follower in the background. A vault it cannot read is retried (vault_status says why);
+    any other failure exits the process so the container restarts from a clean state."""
+
+    def target() -> None:
+        while True:
+            try:
+                follower.run(threading.Event())
+                return
+            except IncompatibleVault as e:
+                log.error("%s follower: %s; retrying in 60s", name, e)
+                time.sleep(60)
+            except Exception:
+                log.exception("%s follower failed; exiting so the container restarts", name)
+                os._exit(1)
+
+    threading.Thread(target=target, name=f"{name}-follower", daemon=True).start()
 
 
 # --- OAuth 2.1 PKCE ---
@@ -580,10 +489,8 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
 
 if __name__ == "__main__":
-    threading.Thread(target=index_vault, daemon=True).start()
-    observer = Observer()
-    observer.schedule(VaultWatcher(), str(VAULT_PATH), recursive=True)
-    observer.start()
+    _follow("catalog", catalog_follower)
+    _follow("semantic-index", index_follower)
 
     mcp_asgi = mcp.http_app(path="/mcp")
 

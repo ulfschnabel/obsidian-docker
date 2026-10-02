@@ -362,7 +362,10 @@ class VaultTools:
 
     def _require_loaded(self) -> None:
         if not self._catalog.loaded:
-            raise StoreUnavailable("the vault catalog is still loading from CouchDB; retry shortly")
+            raise StoreUnavailable(
+                "the vault catalog is not loaded yet (still loading from CouchDB, or the vault cannot be "
+                "read: see vault_status); retry shortly"
+            )
 
     def _resolve(self, path: str) -> str:
         """The existing note's stored path, or the NFC form of `path` for a new note."""

@@ -6,9 +6,12 @@ test, and an httpx client that records every request for one-way assertions.
 """
 from __future__ import annotations
 
+import io
+import json
 import os
 import shutil
 import subprocess
+import tarfile
 import time
 import uuid
 from collections.abc import Iterator
@@ -76,6 +79,7 @@ class RecordedClient:
 class CouchServer:
     url: str  # base URL without credentials, e.g. http://127.0.0.1:49153
     auth: tuple[str, str] = (ADMIN_USER, ADMIN_PASSWORD)
+    container: str | None = None  # docker container name when this harness started it
 
     def client(self) -> httpx.Client:
         return httpx.Client(base_url=self.url, auth=self.auth, timeout=30)
@@ -166,7 +170,7 @@ def couch_server() -> Iterator[CouchServer]:
         port = subprocess.run(
             ["docker", "port", name, "5984/tcp"], check=True, capture_output=True, text=True
         ).stdout.strip().splitlines()[0].rsplit(":", 1)[1]
-        server = CouchServer(url=f"http://127.0.0.1:{port}")
+        server = CouchServer(url=f"http://127.0.0.1:{port}", container=name)
         _wait_ready(server.url)
         yield server
     finally:
@@ -194,3 +198,75 @@ def bare_db(couch_server: CouchServer) -> Iterator[TestDb]:
     yield db
     with couch_server.client() as c:
         c.delete(f"/{db.name}")
+
+
+# --- The real LiveSync core, via its official CLI (design D13) -----------------
+
+CLI_IMAGE = os.environ.get("VAULTSTORE_CLI_IMAGE", "ghcr.io/vrtmrz/livesync-cli:1.0.15-cli")
+
+
+class LivesyncCli:
+    """Runs the official LiveSync CLI against a test database.
+
+    The CLI shares the CouchDB container's network namespace and keeps its
+    local database in a docker volume removed on exit, so nothing is written
+    to the host.
+    """
+
+    def __init__(self, server: CouchServer, db_name: str):
+        assert server.container, "needs a CouchDB started by this harness"
+        self.network = f"container:{server.container}"
+        self.db_name = db_name
+        self.auth = server.auth
+        self.volume = f"vs-cli-{uuid.uuid4().hex[:8]}"
+
+    def __enter__(self) -> LivesyncCli:
+        subprocess.run(["docker", "volume", "create", self.volume], check=True, capture_output=True)
+        self.run("init-settings", "/data/.livesync/settings.json")
+        raw = self._docker("--entrypoint", "cat", CLI_IMAGE, "/data/.livesync/settings.json").stdout
+        settings = json.loads(raw)
+        settings.update(
+            couchDB_URI="http://127.0.0.1:5984", couchDB_USER=self.auth[0], couchDB_PASSWORD=self.auth[1],
+            couchDB_DBNAME=self.db_name, isConfigured=True, liveSync=False,
+        )
+        self._docker("-i", "--entrypoint", "sh", CLI_IMAGE, "-c", "cat > /data/.livesync/settings.json",
+                     input=json.dumps(settings).encode())
+        return self
+
+    def __exit__(self, *exc) -> None:
+        subprocess.run(["docker", "volume", "rm", self.volume], capture_output=True)
+
+    def _docker(self, *args: str, input: bytes | None = None, check: bool = True) -> subprocess.CompletedProcess:
+        r = subprocess.run(
+            ["docker", "run", "--rm", "--network", self.network, "-v", f"{self.volume}:/data", *args],
+            capture_output=True, input=input,
+        )
+        if check and r.returncode != 0:
+            raise RuntimeError(f"livesync-cli {args}: {r.stderr.decode(errors='replace')[-2000:]}")
+        return r
+
+    def run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+        return self._docker(CLI_IMAGE, *args, check=check)
+
+    def mirror(self) -> dict[str, bytes]:
+        """Materialise the local database as files, as a device does; returns {path: bytes}.
+
+        Use this, not `cat`, to read content back: `cat` exits before a piped
+        stdout drains and truncates output at 128 KiB.
+        """
+        self._docker("--entrypoint", "mkdir", CLI_IMAGE, "-p", "/data/vault")
+        self.run("mirror", "/data/vault")
+        tar = self._docker("--entrypoint", "tar", CLI_IMAGE, "-C", "/data/vault", "-cf", "-", ".").stdout
+        with tarfile.open(fileobj=io.BytesIO(tar)) as tf:
+            return {m.name.removeprefix("./"): tf.extractfile(m).read() for m in tf.getmembers() if m.isfile()}
+
+
+@pytest.fixture
+def livesync_cli(couch_server: CouchServer, bare_db: TestDb):
+    """The real core attached to a fresh, empty database (the CLI initialises it)."""
+    if not couch_server.container:
+        pytest.skip("conformance tests need a CouchDB started by this harness")
+    if subprocess.run(["docker", "image", "inspect", CLI_IMAGE], capture_output=True).returncode != 0:
+        pytest.skip(f"pull {CLI_IMAGE} to run conformance tests")
+    with LivesyncCli(couch_server, bare_db.name) as cli:
+        yield cli, bare_db

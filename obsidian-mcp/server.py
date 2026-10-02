@@ -49,6 +49,7 @@ _CLAUDE_CLIENT_ID = "d7251a335098f456c042c6a3d96146d9"
 _SERVER_NAME = "Obsidian MCP"
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # one line per request, every long-poll
 log = logging.getLogger("obsidian-mcp")
 
 

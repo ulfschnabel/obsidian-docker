@@ -148,6 +148,7 @@ def main(env: Mapping[str, str] = os.environ) -> int:
     """Run until stopped. Returns 1 when CouchDB stays unavailable or the vault is unreadable,
     so the container restarts and resumes from its checkpoint; 2 when misconfigured."""
     logging.basicConfig(level=env.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # one line per request, every long-poll
     missing = [k for k in REQUIRED if not env.get(k)]
     if missing:
         log.error("missing settings: %s", ", ".join(missing))
